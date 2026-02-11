@@ -1,0 +1,1 @@
+g++ .\lab1.cpp -o lab1 -fexec-charset=windows-1251
