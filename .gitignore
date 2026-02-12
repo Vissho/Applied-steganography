@@ -1,2 +1,6 @@
 *.exe
 plane_*
+compare_*
+*png
+*csv
+*_stego_*

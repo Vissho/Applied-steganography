@@ -5,6 +5,10 @@
 #include <cstdint>
 #include <bitset>
 #include <filesystem>
+#include <cmath>
+#include <map>
+#include <iomanip>
+#include <algorithm>
 
 namespace fs = std::filesystem;
 
