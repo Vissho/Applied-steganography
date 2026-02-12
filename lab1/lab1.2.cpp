@@ -610,6 +610,10 @@ private:
 int main(int argc, char* argv[]) {
     setlocale(LC_ALL, "");
 
+    fs::create_directories("compare");
+    fs::create_directories("stego");
+    fs::create_directories("visual");
+
     std::string messageFile = "message.txt";
 
     SteganographyResearcher researcher(messageFile);
