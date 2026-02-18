@@ -1,0 +1,466 @@
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <cstdint>
+#include <random>
+#include <cmath>
+#include <filesystem>
+#include <algorithm>
+#include <iomanip>
+
+namespace fs = std::filesystem;
+
+// --- BMP Header (8-bit grayscale) ---
+#pragma pack(push, 1)
+struct BMPHeader {
+    uint16_t bfType;      // 'BM'
+    uint32_t bfSize;
+    uint16_t bfReserved1;
+    uint16_t bfReserved2;
+    uint32_t bfOffBits;
+    uint32_t biSize;
+    int32_t  biWidth;
+    int32_t  biHeight;
+    uint16_t biPlanes;
+    uint16_t biBitCount;  // must be 8
+    uint32_t biCompression;
+    uint32_t biSizeImage;
+    int32_t  biXPelsPerMeter;
+    int32_t  biYPelsPerMeter;
+    uint32_t biClrUsed;
+    uint32_t biClrImportant;
+};
+#pragma pack(pop)
+
+// --- Class for 8-bit grayscale BMP ---
+class GrayBMP {
+private:
+    BMPHeader header;
+    std::vector<uint8_t> palette;   // 256*4 = 1024 bytes
+    std::vector<uint8_t> pixels;    // raw pixel data (grayscale values)
+    int width, height;
+    bool loaded;
+
+    bool readBMP(const std::string& filename) {
+        std::ifstream file(filename, std::ios::binary);
+        if (!file) return false;
+
+        file.read(reinterpret_cast<char*>(&header), sizeof(header));
+        if (header.bfType != 0x4D42 || header.biBitCount != 8)
+            return false;
+
+        width = header.biWidth;
+        height = std::abs(header.biHeight);
+
+        palette.resize(1024);
+        file.seekg(sizeof(header), std::ios::beg);
+        file.read(reinterpret_cast<char*>(palette.data()), 1024);
+
+        file.seekg(header.bfOffBits, std::ios::beg);
+        int rowSize = (width * 8 + 31) / 32 * 4;
+        int dataSize = rowSize * height;
+        std::vector<uint8_t> rawData(dataSize);
+        file.read(reinterpret_cast<char*>(rawData.data()), dataSize);
+
+        pixels.resize(width * height);
+        for (int y = 0; y < height; ++y) {
+            int srcY = (header.biHeight > 0) ? (height - 1 - y) : y;
+            for (int x = 0; x < width; ++x) {
+                pixels[y * width + x] = rawData[srcY * rowSize + x];
+            }
+        }
+        loaded = true;
+        file.close();
+        return true;
+    }
+
+    bool writeBMP(const std::string& filename) {
+        if (!loaded) return false;
+
+        int rowSize = (width * 8 + 31) / 32 * 4;
+        int dataSize = rowSize * height;
+        std::vector<uint8_t> rawData(dataSize, 0);
+
+        for (int y = 0; y < height; ++y) {
+            int dstY = (header.biHeight > 0) ? (height - 1 - y) : y;
+            for (int x = 0; x < width; ++x) {
+                rawData[dstY * rowSize + x] = pixels[y * width + x];
+            }
+        }
+
+        header.bfOffBits = sizeof(header) + 1024;
+        header.bfSize = header.bfOffBits + dataSize;
+        header.biSizeImage = dataSize;
+
+        std::ofstream file(filename, std::ios::binary);
+        if (!file) return false;
+        file.write(reinterpret_cast<char*>(&header), sizeof(header));
+        file.write(reinterpret_cast<char*>(palette.data()), 1024);
+        file.write(reinterpret_cast<char*>(rawData.data()), dataSize);
+        file.close();
+        return true;
+    }
+
+public:
+    GrayBMP() : loaded(false), width(0), height(0) {}
+
+    bool load(const std::string& filename) { return readBMP(filename); }
+    bool save(const std::string& filename) { return writeBMP(filename); }
+
+    int getWidth() const { return width; }
+    int getHeight() const { return height; }
+    int getSize() const { return width * height; }
+
+    uint8_t* data() { return pixels.data(); }
+    const uint8_t* data() const { return pixels.data(); }
+
+    std::vector<uint8_t> getPixels() const { return pixels; }
+    void setPixels(const std::vector<uint8_t>& newPixels) { pixels = newPixels; }
+
+    // Make a deep copy
+    GrayBMP clone() const {
+        GrayBMP copy;
+        copy.header = this->header;
+        copy.palette = this->palette;
+        copy.width = this->width;
+        copy.height = this->height;
+        copy.pixels = this->pixels;
+        copy.loaded = this->loaded;
+        return copy;
+    }
+};
+
+// --- Metrics ---
+class Metrics {
+public:
+    static double MSE(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+        if (a.size() != b.size()) return -1.0;
+        double sum = 0.0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            double diff = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+            sum += diff * diff;
+        }
+        return sum / a.size();
+    }
+
+    static double PSNR(double mse) {
+        if (mse <= 0) return 100.0;
+        return 10.0 * log10((255.0 * 255.0) / mse);
+    }
+};
+
+// --- Digital Watermark (binary image) ---
+class Watermark {
+private:
+    std::vector<uint8_t> bits;   // each byte = 0 or 1 (only LSB used)
+    int w, h;
+public:
+    Watermark() : w(0), h(0) {}
+
+    bool loadFromBMP(const std::string& filename) {
+        GrayBMP img;
+        if (!img.load(filename)) return false;
+        w = img.getWidth();
+        h = img.getHeight();
+        bits.resize(w * h);
+        const uint8_t* pixels = img.data();
+        for (int i = 0; i < w * h; ++i) {
+            // Threshold at 128: any pixel >127 becomes 1 (white), else 0
+            bits[i] = (pixels[i] > 127) ? 1 : 0;
+        }
+        return true;
+    }
+
+    int getWidth() const { return w; }
+    int getHeight() const { return h; }
+    int totalBits() const { return w * h; }
+
+    const std::vector<uint8_t>& getBits() const { return bits; }
+};
+
+// --- Abstract embedding class ---
+class Embedder {
+public:
+    virtual std::string name() const = 0;
+    virtual bool embed(GrayBMP& container, const Watermark& wm, const std::string& key, GrayBMP& stego) = 0;
+    virtual bool extract(const GrayBMP& stego, const std::string& key, int bitsTotal, std::vector<uint8_t>& extractedBits) = 0;
+    virtual ~Embedder() {}
+};
+
+// --- 1) LSB with secret key (pseudorandom permutation) ---
+class LSBKeyEmbedder : public Embedder {
+private:
+    std::mt19937 rng;
+public:
+    std::string name() const override { return "LSB + Secret Key"; }
+
+    bool embed(GrayBMP& container, const Watermark& wm, const std::string& key, GrayBMP& stego) override {
+        int totalPixels = container.getSize();
+        int wmBits = wm.totalBits();
+
+        if (wmBits > totalPixels) {
+            std::cerr << "Watermark too large for container!\n";
+            return false;
+        }
+
+        // Use key to seed RNG
+        std::seed_seq seed(key.begin(), key.end());
+        rng.seed(seed);
+
+        // Create permutation of pixel indices
+        std::vector<int> indices(totalPixels);
+        for (int i = 0; i < totalPixels; ++i) indices[i] = i;
+        std::shuffle(indices.begin(), indices.end(), rng);
+
+        stego = container.clone();
+        uint8_t* pixels = stego.data();
+        const auto& wmBitsVec = wm.getBits();
+
+        // Embed LSB (bit 0) according to permutation
+        for (int i = 0; i < wmBits; ++i) {
+            int pos = indices[i];
+            // Clear LSB, then set to watermark bit
+            pixels[pos] = (pixels[pos] & 0xFE) | wmBitsVec[i];
+        }
+        return true;
+    }
+
+    bool extract(const GrayBMP& stego, const std::string& key, int bitsTotal, std::vector<uint8_t>& extractedBits) override {
+        int totalPixels = stego.getSize();
+        if (bitsTotal > totalPixels) return false;
+
+        std::seed_seq seed(key.begin(), key.end());
+        rng.seed(seed);
+
+        std::vector<int> indices(totalPixels);
+        for (int i = 0; i < totalPixels; ++i) indices[i] = i;
+        std::shuffle(indices.begin(), indices.end(), rng);
+
+        const uint8_t* pixels = stego.data();
+        extractedBits.resize(bitsTotal);
+        for (int i = 0; i < bitsTotal; ++i) {
+            int pos = indices[i];
+            extractedBits[i] = pixels[pos] & 1;
+        }
+        return true;
+    }
+};
+
+// --- 2) Adaptive embedding by local gradient (variant 1) ---
+class AdaptiveGradientEmbedder : public Embedder {
+private:
+    // Compute local gradient magnitude in 3x3 neighborhood
+    double localGradient(const GrayBMP& img, int x, int y) {
+        int w = img.getWidth();
+        int h = img.getHeight();
+        const uint8_t* p = img.data();
+
+        double gx = 0.0, gy = 0.0;
+        int count = 0;
+
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                int nx = x + dx;
+                int ny = y + dy;
+                if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                    // Simple Sobel-like (just horizontal and vertical differences)
+                    if (dx != 0) gx += p[ny * w + nx] * dx;
+                    if (dy != 0) gy += p[ny * w + nx] * dy;
+                    count++;
+                }
+            }
+        }
+        return std::sqrt(gx * gx + gy * gy) / (count ? count : 1);
+    }
+
+public:
+    std::string name() const override { return "Adaptive (Gradient)"; }
+
+    bool embed(GrayBMP& container, const Watermark& wm, const std::string& key, GrayBMP& stego) override {
+        int w = container.getWidth();
+        int h = container.getHeight();
+        int totalPixels = w * h;
+        int wmBits = wm.totalBits();
+
+        if (wmBits > totalPixels) {
+            std::cerr << "Watermark too large!\n";
+            return false;
+        }
+
+        stego = container.clone();
+        uint8_t* pixels = stego.data();
+
+        // Compute gradient for each pixel
+        std::vector<double> gradients(totalPixels);
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                gradients[y * w + x] = localGradient(container, x, y);
+            }
+        }
+
+        // Sort indices by gradient (descending) — high texture first
+        std::vector<int> indices(totalPixels);
+        for (int i = 0; i < totalPixels; ++i) indices[i] = i;
+        std::sort(indices.begin(), indices.end(),
+            [&](int a, int b) { return gradients[a] > gradients[b]; });
+
+        const auto& wmBitsVec = wm.getBits();
+
+        // Embed into LSB of pixels with highest gradient
+        for (int i = 0; i < wmBits; ++i) {
+            int pos = indices[i];
+            pixels[pos] = (pixels[pos] & 0xFE) | wmBitsVec[i];
+        }
+        return true;
+    }
+
+    bool extract(const GrayBMP& stego, const std::string& key, int bitsTotal, std::vector<uint8_t>& extractedBits) override {
+        int w = stego.getWidth();
+        int h = stego.getHeight();
+        int totalPixels = w * h;
+
+        if (bitsTotal > totalPixels) return false;
+
+        // Need to recompute gradient from the *original* container? 
+        // But we don't have it. So we must extract using same rule:
+        // The watermark is in the pixels with highest gradient of the *stego* image.
+        // This is an approximation; for exact recovery we'd need side info.
+        // Here we assume gradient order is preserved (reasonable for small changes).
+        std::vector<double> gradients(totalPixels);
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                // Compute gradient on stego image
+                double g = 0.0;
+                int count = 0;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        int nx = x + dx, ny = y + dy;
+                        if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                            g += std::abs(int(stego.data()[ny * w + nx]) - int(stego.data()[y * w + x]));
+                            count++;
+                        }
+                    }
+                }
+                gradients[y * w + x] = g / (count ? count : 1);
+            }
+        }
+
+        std::vector<int> indices(totalPixels);
+        for (int i = 0; i < totalPixels; ++i) indices[i] = i;
+        std::sort(indices.begin(), indices.end(),
+            [&](int a, int b) { return gradients[a] > gradients[b]; });
+
+        const uint8_t* pixels = stego.data();
+        extractedBits.resize(bitsTotal);
+        for (int i = 0; i < bitsTotal; ++i) {
+            int pos = indices[i];
+            extractedBits[i] = pixels[pos] & 1;
+        }
+        return true;
+    }
+};
+
+// --- Verification: compare extracted bits with original watermark bits ---
+bool verifyWatermark(const std::vector<uint8_t>& extracted, const Watermark& wm) {
+    const auto& original = wm.getBits();
+    if (extracted.size() != original.size()) return false;
+    int errors = 0;
+    for (size_t i = 0; i < extracted.size(); ++i) {
+        if (extracted[i] != original[i]) errors++;
+    }
+    double errorRate = 100.0 * errors / original.size();
+    std::cout << "  Verification: errors = " << errors << "/" << original.size()
+              << " (" << std::fixed << std::setprecision(2) << errorRate << "%)\n";
+    return errors == 0;
+}
+
+// --- Main test routine ---
+void testOnDataset(const std::string& datasetPath, const std::string& datasetName,
+                   Embedder& embedder, const Watermark& wm, const std::string& key) {
+    std::cout << "\n===== Testing on " << datasetName << " =====\n";
+    std::cout << "Embedder: " << embedder.name() << "\n";
+
+    int count = 0;
+    double totalPSNR = 0.0;
+
+    for (const auto& entry : fs::directory_iterator(datasetPath)) {
+        if (entry.path().extension() != ".bmp") continue;
+        if (++count > 10) break;
+
+        GrayBMP container;
+        if (!container.load(entry.path().string())) {
+            std::cerr << "Failed to load " << entry.path() << "\n";
+            continue;
+        }
+
+        if (container.getSize() < wm.totalBits()) {
+            std::cout << "  Skipping " << entry.path().filename() << " (too small)\n";
+            continue;
+        }
+
+        GrayBMP stego;
+        if (!embedder.embed(container, wm, key, stego)) {
+            std::cerr << "Embedding failed for " << entry.path() << "\n";
+            continue;
+        }
+
+        std::vector<uint8_t> extracted;
+        if (!embedder.extract(stego, key, wm.totalBits(), extracted)) {
+            std::cerr << "Extraction failed for " << entry.path() << "\n";
+            continue;
+        }
+
+        std::cout << "\nImage: " << entry.path().filename() << "\n";
+        bool ok = verifyWatermark(extracted, wm);
+
+        double mse = Metrics::MSE(container.getPixels(), stego.getPixels());
+        double psnr = Metrics::PSNR(mse);
+        totalPSNR += psnr;
+        std::cout << "  PSNR = " << std::fixed << std::setprecision(2) << psnr << " dB\n";
+
+        std::string outName = "stego/" + datasetName + "/" + embedder.name() + "_" + entry.path().stem().string() + ".bmp";
+        stego.save(outName);
+    }
+
+    if (count > 0) {
+        std::cout << "\nAverage PSNR for " << datasetName << ": "
+                  << std::fixed << std::setprecision(2) << (totalPSNR / count) << " dB\n";
+    }
+}
+
+int main() {
+    fs::create_directories("stego");
+    fs::create_directories("stego/BOSS");
+    fs::create_directories("stego/Medical");
+    fs::create_directories("stego/Flowers");
+
+    std::string bossPath   = "../lab1/set1";
+    std::string medicalPath = "../lab1/set2";
+    std::string otherPath  = "../lab1/set3";
+
+    Watermark wm;
+    if (!wm.loadFromBMP("./logo.bmp")) {
+        std::cerr << "Please provide a logo.bmp (binary image) as watermark.\n";
+        return 1;
+    }
+    std::cout << "Watermark loaded: " << wm.getWidth() << "x" << wm.getHeight()
+              << " (" << wm.totalBits() << " bits)\n";
+
+    std::string secretKey = "my_secret_phrase_123";
+
+    LSBKeyEmbedder lsbEmbedder;
+    AdaptiveGradientEmbedder adaptiveEmbedder;
+
+    testOnDataset(bossPath, "BOSS", lsbEmbedder, wm, secretKey);
+    testOnDataset(bossPath, "BOSS", adaptiveEmbedder, wm, secretKey);
+
+    testOnDataset(medicalPath, "Medical", lsbEmbedder, wm, secretKey);
+    testOnDataset(medicalPath, "Medical", adaptiveEmbedder, wm, secretKey);
+
+    testOnDataset(otherPath, "Flowers", lsbEmbedder, wm, secretKey);
+    testOnDataset(otherPath, "Flowers", adaptiveEmbedder, wm, secretKey);
+
+    std::cout << "\nDone.\n";
+    return 0;
+}

@@ -10,10 +10,10 @@ def convert_to_8bit_bmp(input_path, output_path):
     img.save(output_path, 'BMP')
 
 # Пример: конвертировать все jpg из папки 'raw_medical'
-for filename in os.listdir('set2'):
+for filename in os.listdir('../lab2'):
     if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-        input_file = os.path.join('set2', filename)
-        output_file = os.path.join('set2/', filename.rsplit('.', 1)[0] + '.bmp')
+        input_file = os.path.join('../lab2', filename)
+        output_file = os.path.join('../lab2', filename.rsplit('.', 1)[0] + '.bmp')
         convert_to_8bit_bmp(input_file, output_file)
         print(f'✓ {filename} -> {output_file}')
 
