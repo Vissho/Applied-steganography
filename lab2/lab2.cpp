@@ -8,13 +8,13 @@
 #include <filesystem>
 #include <algorithm>
 #include <iomanip>
+#include <cstring>
 
 namespace fs = std::filesystem;
 
-// --- BMP Header (8-bit grayscale) ---
 #pragma pack(push, 1)
 struct BMPHeader {
-    uint16_t bfType;      // 'BM'
+    uint16_t bfType;
     uint32_t bfSize;
     uint16_t bfReserved1;
     uint16_t bfReserved2;
@@ -23,7 +23,7 @@ struct BMPHeader {
     int32_t  biWidth;
     int32_t  biHeight;
     uint16_t biPlanes;
-    uint16_t biBitCount;  // must be 8
+    uint16_t biBitCount;
     uint32_t biCompression;
     uint32_t biSizeImage;
     int32_t  biXPelsPerMeter;
@@ -33,12 +33,11 @@ struct BMPHeader {
 };
 #pragma pack(pop)
 
-// --- Class for 8-bit grayscale BMP ---
 class GrayBMP {
 private:
     BMPHeader header;
-    std::vector<uint8_t> palette;   // 256*4 = 1024 bytes
-    std::vector<uint8_t> pixels;    // raw pixel data (grayscale values)
+    std::vector<uint8_t> palette;
+    std::vector<uint8_t> pixels;
     int width, height;
     bool loaded;
 
@@ -118,7 +117,6 @@ public:
     std::vector<uint8_t> getPixels() const { return pixels; }
     void setPixels(const std::vector<uint8_t>& newPixels) { pixels = newPixels; }
 
-    // Make a deep copy
     GrayBMP clone() const {
         GrayBMP copy;
         copy.header = this->header;
@@ -131,7 +129,6 @@ public:
     }
 };
 
-// --- Metrics ---
 class Metrics {
 public:
     static double MSE(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
@@ -150,10 +147,9 @@ public:
     }
 };
 
-// --- Digital Watermark (binary image) ---
 class Watermark {
 private:
-    std::vector<uint8_t> bits;   // each byte = 0 or 1 (only LSB used)
+    std::vector<uint8_t> bits;
     int w, h;
 public:
     Watermark() : w(0), h(0) {}
@@ -166,7 +162,6 @@ public:
         bits.resize(w * h);
         const uint8_t* pixels = img.data();
         for (int i = 0; i < w * h; ++i) {
-            // Threshold at 128: any pixel >127 becomes 1 (white), else 0
             bits[i] = (pixels[i] > 127) ? 1 : 0;
         }
         return true;
@@ -179,16 +174,15 @@ public:
     const std::vector<uint8_t>& getBits() const { return bits; }
 };
 
-// --- Abstract embedding class ---
 class Embedder {
 public:
     virtual std::string name() const = 0;
     virtual bool embed(GrayBMP& container, const Watermark& wm, const std::string& key, GrayBMP& stego) = 0;
     virtual bool extract(const GrayBMP& stego, const std::string& key, int bitsTotal, std::vector<uint8_t>& extractedBits) = 0;
+    virtual bool createImageFromBits(const std::vector<uint8_t>& extractedBits, int width, int height, const std::string& filename) = 0;
     virtual ~Embedder() {}
 };
 
-// --- 1) LSB with secret key (pseudorandom permutation) ---
 class LSBKeyEmbedder : public Embedder {
 private:
     std::mt19937 rng;
@@ -204,11 +198,9 @@ public:
             return false;
         }
 
-        // Use key to seed RNG
         std::seed_seq seed(key.begin(), key.end());
         rng.seed(seed);
 
-        // Create permutation of pixel indices
         std::vector<int> indices(totalPixels);
         for (int i = 0; i < totalPixels; ++i) indices[i] = i;
         std::shuffle(indices.begin(), indices.end(), rng);
@@ -217,10 +209,8 @@ public:
         uint8_t* pixels = stego.data();
         const auto& wmBitsVec = wm.getBits();
 
-        // Embed LSB (bit 0) according to permutation
         for (int i = 0; i < wmBits; ++i) {
             int pos = indices[i];
-            // Clear LSB, then set to watermark bit
             pixels[pos] = (pixels[pos] & 0xFE) | wmBitsVec[i];
         }
         return true;
@@ -245,12 +235,79 @@ public:
         }
         return true;
     }
+
+    bool createImageFromBits(const std::vector<uint8_t>& extractedBits, int width, int height, const std::string& filename)
+    {
+        
+        if (extractedBits.size() != static_cast<size_t>(width * height)) {
+            std::cerr << "Ошибка: размер битов (" << extractedBits.size() 
+                    << ") не соответствует размеру изображения (" 
+                    << width * height << ")" << std::endl;
+            return false;
+        }
+        
+        int rowSize = (width * 8 + 31) / 32 * 4;
+        int dataSize = rowSize * height;
+        
+        BMPHeader header;
+        std::memset(&header, 0, sizeof(header));
+        
+        header.bfType = 0x4D42;
+        header.bfOffBits = sizeof(header) + 1024;
+        header.bfSize = header.bfOffBits + dataSize;
+        
+        header.biSize = 40;
+        header.biWidth = width;
+        header.biHeight = height;
+        header.biPlanes = 1;
+        header.biBitCount = 8;
+        header.biCompression = 0;
+        header.biSizeImage = dataSize;
+        header.biXPelsPerMeter = 2835;
+        header.biYPelsPerMeter = 2835;
+        header.biClrUsed = 256;
+        header.biClrImportant = 256;
+        
+        std::ofstream file(filename, std::ios::binary);
+        if (!file) {
+            std::cerr << "Ошибка: не удалось создать файл " << filename << std::endl;
+            return false;
+        }
+        
+        file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        
+        for (int i = 0; i < 256; ++i) {
+            uint8_t paletteEntry[4] = {
+                static_cast<uint8_t>(i),  
+                static_cast<uint8_t>(i),  
+                static_cast<uint8_t>(i),  
+                0                          
+            };
+            file.write(reinterpret_cast<const char*>(paletteEntry), 4);
+        }
+        
+        std::vector<uint8_t> rawData(dataSize, 0);
+        
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                int pixelIndex = y * width + x;
+                uint8_t value = extractedBits[pixelIndex] ? 255 : 0;
+                
+                int dstY = (header.biHeight > 0) ? (height - 1 - y) : y;
+                rawData[dstY * rowSize + x] = value;
+            }
+        }
+        
+        file.write(reinterpret_cast<const char*>(rawData.data()), dataSize);
+        
+        file.close();
+        
+        return true;
+    }
 };
 
-// --- 2) Adaptive embedding by local gradient (variant 1) ---
 class AdaptiveGradientEmbedder : public Embedder {
 private:
-    // Compute local gradient magnitude in 3x3 neighborhood
     double localGradient(const GrayBMP& img, int x, int y) {
         int w = img.getWidth();
         int h = img.getHeight();
@@ -264,7 +321,6 @@ private:
                 int nx = x + dx;
                 int ny = y + dy;
                 if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-                    // Simple Sobel-like (just horizontal and vertical differences)
                     if (dx != 0) gx += p[ny * w + nx] * dx;
                     if (dy != 0) gy += p[ny * w + nx] * dy;
                     count++;
@@ -291,7 +347,6 @@ public:
         stego = container.clone();
         uint8_t* pixels = stego.data();
 
-        // Compute gradient for each pixel
         std::vector<double> gradients(totalPixels);
         for (int y = 0; y < h; ++y) {
             for (int x = 0; x < w; ++x) {
@@ -299,7 +354,6 @@ public:
             }
         }
 
-        // Sort indices by gradient (descending) — high texture first
         std::vector<int> indices(totalPixels);
         for (int i = 0; i < totalPixels; ++i) indices[i] = i;
         std::sort(indices.begin(), indices.end(),
@@ -307,7 +361,6 @@ public:
 
         const auto& wmBitsVec = wm.getBits();
 
-        // Embed into LSB of pixels with highest gradient
         for (int i = 0; i < wmBits; ++i) {
             int pos = indices[i];
             pixels[pos] = (pixels[pos] & 0xFE) | wmBitsVec[i];
@@ -322,15 +375,9 @@ public:
 
         if (bitsTotal > totalPixels) return false;
 
-        // Need to recompute gradient from the *original* container? 
-        // But we don't have it. So we must extract using same rule:
-        // The watermark is in the pixels with highest gradient of the *stego* image.
-        // This is an approximation; for exact recovery we'd need side info.
-        // Here we assume gradient order is preserved (reasonable for small changes).
         std::vector<double> gradients(totalPixels);
         for (int y = 0; y < h; ++y) {
             for (int x = 0; x < w; ++x) {
-                // Compute gradient on stego image
                 double g = 0.0;
                 int count = 0;
                 for (int dy = -1; dy <= 1; ++dy) {
@@ -359,9 +406,77 @@ public:
         }
         return true;
     }
+
+        bool createImageFromBits(const std::vector<uint8_t>& extractedBits, int width, int height, const std::string& filename)
+    {
+        
+        if (extractedBits.size() != static_cast<size_t>(width * height)) {
+            std::cerr << "Ошибка: размер битов (" << extractedBits.size() 
+                    << ") не соответствует размеру изображения (" 
+                    << width * height << ")" << std::endl;
+            return false;
+        }
+        
+        int rowSize = (width * 8 + 31) / 32 * 4;
+        int dataSize = rowSize * height;
+        
+        BMPHeader header;
+        std::memset(&header, 0, sizeof(header));
+        
+        header.bfType = 0x4D42;
+        header.bfOffBits = sizeof(header) + 1024;
+        header.bfSize = header.bfOffBits + dataSize;
+        
+        header.biSize = 40;
+        header.biWidth = width;
+        header.biHeight = height;
+        header.biPlanes = 1;
+        header.biBitCount = 8;
+        header.biCompression = 0;
+        header.biSizeImage = dataSize;
+        header.biXPelsPerMeter = 2835;
+        header.biYPelsPerMeter = 2835;
+        header.biClrUsed = 256;
+        header.biClrImportant = 256;
+        
+        std::ofstream file(filename, std::ios::binary);
+        if (!file) {
+            std::cerr << "Ошибка: не удалось создать файл " << filename << std::endl;
+            return false;
+        }
+        
+        file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        
+        for (int i = 0; i < 256; ++i) {
+            uint8_t paletteEntry[4] = {
+                static_cast<uint8_t>(i),  
+                static_cast<uint8_t>(i),  
+                static_cast<uint8_t>(i),  
+                0                          
+            };
+            file.write(reinterpret_cast<const char*>(paletteEntry), 4);
+        }
+        
+        std::vector<uint8_t> rawData(dataSize, 0);
+        
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                int pixelIndex = y * width + x;
+                uint8_t value = extractedBits[pixelIndex] ? 255 : 0;
+                
+                int dstY = (header.biHeight > 0) ? (height - 1 - y) : y;
+                rawData[dstY * rowSize + x] = value;
+            }
+        }
+        
+        file.write(reinterpret_cast<const char*>(rawData.data()), dataSize);
+        
+        file.close();
+        
+        return true;
+    }
 };
 
-// --- Verification: compare extracted bits with original watermark bits ---
 bool verifyWatermark(const std::vector<uint8_t>& extracted, const Watermark& wm) {
     const auto& original = wm.getBits();
     if (extracted.size() != original.size()) return false;
@@ -375,7 +490,6 @@ bool verifyWatermark(const std::vector<uint8_t>& extracted, const Watermark& wm)
     return errors == 0;
 }
 
-// --- Main test routine ---
 void testOnDataset(const std::string& datasetPath, const std::string& datasetName,
                    Embedder& embedder, const Watermark& wm, const std::string& key) {
     std::cout << "\n===== Testing on " << datasetName << " =====\n";
@@ -408,6 +522,11 @@ void testOnDataset(const std::string& datasetPath, const std::string& datasetNam
         std::vector<uint8_t> extracted;
         if (!embedder.extract(stego, key, wm.totalBits(), extracted)) {
             std::cerr << "Extraction failed for " << entry.path() << "\n";
+            continue;
+        }
+        
+        if (!embedder.createImageFromBits(extracted, wm.getWidth(), wm.getHeight(), "stego/" + datasetName + "/" + "extracted_" + embedder.name() + "_" + entry.path().stem().string() + ".bmp")) {
+            std::cerr << "Create failed for " << entry.path() << "\n";
             continue;
         }
 
@@ -461,6 +580,5 @@ int main() {
     testOnDataset(otherPath, "Flowers", lsbEmbedder, wm, secretKey);
     testOnDataset(otherPath, "Flowers", adaptiveEmbedder, wm, secretKey);
 
-    std::cout << "\nDone.\n";
     return 0;
 }
