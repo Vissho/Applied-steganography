@@ -393,7 +393,7 @@ public:
 
 class BlockAdaptiveEmbedder : public Embedder {
 private:
-    static constexpr int BLOCK_SIZE = 2;
+    static constexpr int BLOCK_SIZE = 4;
     
     double computeBlockGradient(const GrayBMP& img, int startX, int startY) {
         int w = img.getWidth();
@@ -719,7 +719,7 @@ int main() {
     std::string otherPath  = "../lab1/set3";
 
     Watermark wm;
-    if (!wm.loadFromBMP("./watermark3.bmp")) {
+    if (!wm.loadFromBMP("./watermark4.bmp")) {
         std::cerr << "Please provide a logo.bmp (binary image) as watermark.\n";
         return 1;
     }
