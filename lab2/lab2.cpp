@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <cstring>
+#include <bitset>
 
 namespace fs = std::filesystem;
 
@@ -127,6 +128,34 @@ public:
         copy.loaded = this->loaded;
         return copy;
     }
+
+    GrayBMP extractBitPlane(int k) {
+        GrayBMP result;
+        if (!loaded || k < 1 || k > 8) return result;
+
+        result.header = this->header;
+        result.palette = this->palette;
+        result.width = this->width;
+        result.height = this->height;
+        result.loaded = true;
+
+        for (int i = 0; i < 256; i++) {
+            uint8_t val = (i == 0) ? 0 : (i == 255 ? 255 : i);
+            result.palette[i*4 + 0] = val;
+            result.palette[i*4 + 1] = val;
+            result.palette[i*4 + 2] = val;
+            result.palette[i*4 + 3] = 0;
+        }
+
+        result.pixels.resize(width * height);
+        int bitPos = k - 1;
+        for (size_t i = 0; i < pixels.size(); i++) {
+            int bit = (pixels[i] >> bitPos) & 1;
+            result.pixels[i] = bit ? 255 : 0;
+        }
+
+        return result;
+    }
 };
 
 class Metrics {
@@ -179,70 +208,135 @@ public:
     virtual std::string name() const = 0;
     virtual bool embed(GrayBMP& container, const Watermark& wm, const std::string& key, GrayBMP& stego) = 0;
     virtual bool extract(const GrayBMP& stego, const std::string& key, int bitsTotal, std::vector<uint8_t>& extractedBits) = 0;
-    virtual bool createImageFromBits(const std::vector<uint8_t>& extractedBits, int width, int height, const std::string& filename) = 0;
+    virtual bool createWatermarkImage(const std::vector<uint8_t>& bits, int width, int height, const std::string& filename) = 0;
     virtual ~Embedder() {}
 };
 
-class LSBKeyEmbedder : public Embedder {
+class BlockLSBEmbedder : public Embedder {
 private:
+    static constexpr int BLOCK_SIZE = 2;
     std::mt19937 rng;
-public:
-    std::string name() const override { return "LSB + Secret Key"; }
-
-    bool embed(GrayBMP& container, const Watermark& wm, const std::string& key, GrayBMP& stego) override {
-        int totalPixels = container.getSize();
-        int wmBits = wm.totalBits();
-
-        if (wmBits > totalPixels) {
-            std::cerr << "Watermark too large for container!\n";
-            return false;
-        }
-
+    
+    std::vector<int> getBlockOrder(int totalBlocks, const std::string& key) {
+        std::vector<int> indices(totalBlocks);
+        for (int i = 0; i < totalBlocks; ++i) indices[i] = i;
+        
         std::seed_seq seed(key.begin(), key.end());
         rng.seed(seed);
-
-        std::vector<int> indices(totalPixels);
-        for (int i = 0; i < totalPixels; ++i) indices[i] = i;
         std::shuffle(indices.begin(), indices.end(), rng);
+        return indices;
+    }
+    
+    uint8_t embedBitInBlock(const std::vector<uint8_t>& block, int bit) {
+        int sum = 0;
+        for (uint8_t val : block) {
+            sum += val;
+        }
+        int parity = sum % 2;
+        
+        if (parity == bit) {
+            return block[0];
+        } else {
+            if (block[0] > 0) {
+                return block[0] - 1;
+            } else {
+                return block[0] + 1;
+            }
+        }
+    }
+    
+    int extractBitFromBlock(const std::vector<uint8_t>& block) {
+        int sum = 0;
+        for (uint8_t val : block) {
+            sum += val;
+        }
+        return sum % 2;
+    }
+
+public:
+    std::string name() const override { return "BlockLSB"; }
+
+    bool embed(GrayBMP& container, const Watermark& wm, const std::string& key, GrayBMP& stego) override {
+        int w = container.getWidth();
+        int h = container.getHeight();
+        int wmBits = wm.totalBits();
+        
+        int blocksX = w / BLOCK_SIZE;
+        int blocksY = h / BLOCK_SIZE;
+        int totalBlocks = blocksX * blocksY;
+        
+        if (wmBits > totalBlocks) {
+            std::cerr << "Watermark too large! Need " << wmBits << " blocks, have " << totalBlocks << "\n";
+            return false;
+        }
 
         stego = container.clone();
         uint8_t* pixels = stego.data();
         const auto& wmBitsVec = wm.getBits();
+        
+        std::vector<int> blockOrder = getBlockOrder(totalBlocks, key);
 
         for (int i = 0; i < wmBits; ++i) {
-            int pos = indices[i];
-            pixels[pos] = (pixels[pos] & 0xFE) | wmBitsVec[i];
+            int blockIdx = blockOrder[i];
+            int blockX = (blockIdx % blocksX) * BLOCK_SIZE;
+            int blockY = (blockIdx / blocksX) * BLOCK_SIZE;
+            
+            std::vector<uint8_t> block;
+            for (int by = 0; by < BLOCK_SIZE; ++by) {
+                for (int bx = 0; bx < BLOCK_SIZE; ++bx) {
+                    int px = blockX + bx;
+                    int py = blockY + by;
+                    block.push_back(pixels[py * w + px]);
+                }
+            }
+            
+            uint8_t newFirstPixel = embedBitInBlock(block, wmBitsVec[i]);
+            pixels[blockY * w + blockX] = newFirstPixel;
         }
+        
         return true;
     }
 
     bool extract(const GrayBMP& stego, const std::string& key, int bitsTotal, std::vector<uint8_t>& extractedBits) override {
-        int totalPixels = stego.getSize();
-        if (bitsTotal > totalPixels) return false;
-
-        std::seed_seq seed(key.begin(), key.end());
-        rng.seed(seed);
-
-        std::vector<int> indices(totalPixels);
-        for (int i = 0; i < totalPixels; ++i) indices[i] = i;
-        std::shuffle(indices.begin(), indices.end(), rng);
-
+        int w = stego.getWidth();
+        int h = stego.getHeight();
+        
+        int blocksX = w / BLOCK_SIZE;
+        int blocksY = h / BLOCK_SIZE;
+        int totalBlocks = blocksX * blocksY;
+        
+        if (bitsTotal > totalBlocks) return false;
+        
         const uint8_t* pixels = stego.data();
         extractedBits.resize(bitsTotal);
+        
+        std::vector<int> blockOrder = getBlockOrder(totalBlocks, key);
+
         for (int i = 0; i < bitsTotal; ++i) {
-            int pos = indices[i];
-            extractedBits[i] = pixels[pos] & 1;
+            int blockIdx = blockOrder[i];
+            int blockX = (blockIdx % blocksX) * BLOCK_SIZE;
+            int blockY = (blockIdx / blocksX) * BLOCK_SIZE;
+            
+            std::vector<uint8_t> block;
+            for (int by = 0; by < BLOCK_SIZE; ++by) {
+                for (int bx = 0; bx < BLOCK_SIZE; ++bx) {
+                    int px = blockX + bx;
+                    int py = blockY + by;
+                    block.push_back(pixels[py * w + px]);
+                }
+            }
+            
+            extractedBits[i] = extractBitFromBlock(block);
         }
+        
         return true;
     }
 
-    bool createImageFromBits(const std::vector<uint8_t>& extractedBits, int width, int height, const std::string& filename)
-    {
+    bool createWatermarkImage(const std::vector<uint8_t>& bits, 
+                              int width, int height, 
+                              const std::string& filename) override {
         
-        if (extractedBits.size() != static_cast<size_t>(width * height)) {
-            std::cerr << "Ошибка: размер битов (" << extractedBits.size() 
-                    << ") не соответствует размеру изображения (" 
-                    << width * height << ")" << std::endl;
+        if (bits.size() != static_cast<size_t>(width * height)) {
             return false;
         }
         
@@ -255,33 +349,25 @@ public:
         header.bfType = 0x4D42;
         header.bfOffBits = sizeof(header) + 1024;
         header.bfSize = header.bfOffBits + dataSize;
-        
         header.biSize = 40;
         header.biWidth = width;
         header.biHeight = height;
         header.biPlanes = 1;
         header.biBitCount = 8;
-        header.biCompression = 0;
         header.biSizeImage = dataSize;
-        header.biXPelsPerMeter = 2835;
-        header.biYPelsPerMeter = 2835;
         header.biClrUsed = 256;
-        header.biClrImportant = 256;
         
         std::ofstream file(filename, std::ios::binary);
-        if (!file) {
-            std::cerr << "Ошибка: не удалось создать файл " << filename << std::endl;
-            return false;
-        }
+        if (!file) return false;
         
         file.write(reinterpret_cast<const char*>(&header), sizeof(header));
         
         for (int i = 0; i < 256; ++i) {
             uint8_t paletteEntry[4] = {
-                static_cast<uint8_t>(i),  
-                static_cast<uint8_t>(i),  
-                static_cast<uint8_t>(i),  
-                0                          
+                static_cast<uint8_t>(i),
+                static_cast<uint8_t>(i),
+                static_cast<uint8_t>(i),
+                0
             };
             file.write(reinterpret_cast<const char*>(paletteEntry), 4);
         }
@@ -291,7 +377,7 @@ public:
         for (int y = 0; y < height; ++y) {
             for (int x = 0; x < width; ++x) {
                 int pixelIndex = y * width + x;
-                uint8_t value = extractedBits[pixelIndex] ? 255 : 0;
+                uint8_t value = bits[pixelIndex] ? 255 : 0;
                 
                 int dstY = (header.biHeight > 0) ? (height - 1 - y) : y;
                 rawData[dstY * rowSize + x] = value;
@@ -299,121 +385,166 @@ public:
         }
         
         file.write(reinterpret_cast<const char*>(rawData.data()), dataSize);
-        
         file.close();
         
         return true;
     }
 };
 
-class AdaptiveGradientEmbedder : public Embedder {
+class BlockAdaptiveEmbedder : public Embedder {
 private:
-    double localGradient(const GrayBMP& img, int x, int y) {
+    static constexpr int BLOCK_SIZE = 2;
+    
+    double computeBlockGradient(const GrayBMP& img, int startX, int startY) {
         int w = img.getWidth();
-        int h = img.getHeight();
-        const uint8_t* p = img.data();
-
-        double gx = 0.0, gy = 0.0;
+        const uint8_t* pixels = img.data();
+        double totalGradient = 0.0;
         int count = 0;
-
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                int nx = x + dx;
-                int ny = y + dy;
-                if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-                    if (dx != 0) gx += p[ny * w + nx] * dx;
-                    if (dy != 0) gy += p[ny * w + nx] * dy;
+        
+        for (int y = startY; y < startY + BLOCK_SIZE; ++y) {
+            for (int x = startX; x < startX + BLOCK_SIZE; ++x) {
+                if (x > 0 && x < w - 1 && y > 0 && y < img.getHeight() - 1) {
+                    double gx = pixels[y * w + x + 1] - pixels[y * w + x - 1];
+                    double gy = pixels[(y + 1) * w + x] - pixels[(y - 1) * w + x];
+                    totalGradient += std::sqrt(gx * gx + gy * gy);
                     count++;
                 }
             }
         }
-        return std::sqrt(gx * gx + gy * gy) / (count ? count : 1);
+        
+        return count > 0 ? totalGradient / count : 0.0;
+    }
+    
+    uint8_t embedBitInBlock(const std::vector<uint8_t>& block, int bit) {
+        int sum = 0;
+        for (uint8_t val : block) {
+            sum += val;
+        }
+        int parity = sum % 2;
+        
+        if (parity == bit) {
+            return block[0];
+        } else {
+            if (block[0] > 0) {
+                return block[0] - 1;
+            } else {
+                return block[0] + 1;
+            }
+        }
+    }
+    
+    int extractBitFromBlock(const std::vector<uint8_t>& block) {
+        int sum = 0;
+        for (uint8_t val : block) {
+            sum += val;
+        }
+        return sum % 2;
     }
 
 public:
-    std::string name() const override { return "Adaptive (Gradient)"; }
+    std::string name() const override { return "BlockAdaptive"; }
 
     bool embed(GrayBMP& container, const Watermark& wm, const std::string& key, GrayBMP& stego) override {
         int w = container.getWidth();
         int h = container.getHeight();
-        int totalPixels = w * h;
         int wmBits = wm.totalBits();
-
-        if (wmBits > totalPixels) {
-            std::cerr << "Watermark too large!\n";
+        
+        int blocksX = w / BLOCK_SIZE;
+        int blocksY = h / BLOCK_SIZE;
+        int totalBlocks = blocksX * blocksY;
+        
+        if (wmBits > totalBlocks) {
+            std::cerr << "Watermark too large! Need " << wmBits << " blocks, have " << totalBlocks << "\n";
             return false;
         }
 
         stego = container.clone();
         uint8_t* pixels = stego.data();
-
-        std::vector<double> gradients(totalPixels);
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                gradients[y * w + x] = localGradient(container, x, y);
+        const auto& wmBitsVec = wm.getBits();
+        
+        std::vector<std::pair<double, int>> blockGradients;
+        for (int by = 0; by < blocksY; ++by) {
+            for (int bx = 0; bx < blocksX; ++bx) {
+                int blockIdx = by * blocksX + bx;
+                double gradient = computeBlockGradient(container, bx * BLOCK_SIZE, by * BLOCK_SIZE);
+                blockGradients.push_back({gradient, blockIdx});
             }
         }
-
-        std::vector<int> indices(totalPixels);
-        for (int i = 0; i < totalPixels; ++i) indices[i] = i;
-        std::sort(indices.begin(), indices.end(),
-            [&](int a, int b) { return gradients[a] > gradients[b]; });
-
-        const auto& wmBitsVec = wm.getBits();
+        
+        std::sort(blockGradients.begin(), blockGradients.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
 
         for (int i = 0; i < wmBits; ++i) {
-            int pos = indices[i];
-            pixels[pos] = (pixels[pos] & 0xFE) | wmBitsVec[i];
+            int blockIdx = blockGradients[i].second;
+            int blockX = (blockIdx % blocksX) * BLOCK_SIZE;
+            int blockY = (blockIdx / blocksX) * BLOCK_SIZE;
+            
+            std::vector<uint8_t> block;
+            for (int by = 0; by < BLOCK_SIZE; ++by) {
+                for (int bx = 0; bx < BLOCK_SIZE; ++bx) {
+                    int px = blockX + bx;
+                    int py = blockY + by;
+                    block.push_back(pixels[py * w + px]);
+                }
+            }
+            
+            uint8_t newFirstPixel = embedBitInBlock(block, wmBitsVec[i]);
+            pixels[blockY * w + blockX] = newFirstPixel;
         }
+        
         return true;
     }
 
     bool extract(const GrayBMP& stego, const std::string& key, int bitsTotal, std::vector<uint8_t>& extractedBits) override {
         int w = stego.getWidth();
         int h = stego.getHeight();
-        int totalPixels = w * h;
-
-        if (bitsTotal > totalPixels) return false;
-
-        std::vector<double> gradients(totalPixels);
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                double g = 0.0;
-                int count = 0;
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        int nx = x + dx, ny = y + dy;
-                        if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-                            g += std::abs(int(stego.data()[ny * w + nx]) - int(stego.data()[y * w + x]));
-                            count++;
-                        }
-                    }
-                }
-                gradients[y * w + x] = g / (count ? count : 1);
-            }
-        }
-
-        std::vector<int> indices(totalPixels);
-        for (int i = 0; i < totalPixels; ++i) indices[i] = i;
-        std::sort(indices.begin(), indices.end(),
-            [&](int a, int b) { return gradients[a] > gradients[b]; });
-
+        
+        int blocksX = w / BLOCK_SIZE;
+        int blocksY = h / BLOCK_SIZE;
+        int totalBlocks = blocksX * blocksY;
+        
+        if (bitsTotal > totalBlocks) return false;
+        
         const uint8_t* pixels = stego.data();
         extractedBits.resize(bitsTotal);
-        for (int i = 0; i < bitsTotal; ++i) {
-            int pos = indices[i];
-            extractedBits[i] = pixels[pos] & 1;
+        
+        std::vector<std::pair<double, int>> blockGradients;
+        for (int by = 0; by < blocksY; ++by) {
+            for (int bx = 0; bx < blocksX; ++bx) {
+                int blockIdx = by * blocksX + bx;
+                double gradient = computeBlockGradient(stego, bx * BLOCK_SIZE, by * BLOCK_SIZE);
+                blockGradients.push_back({gradient, blockIdx});
+            }
         }
+        
+        std::sort(blockGradients.begin(), blockGradients.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        for (int i = 0; i < bitsTotal; ++i) {
+            int blockIdx = blockGradients[i].second;
+            int blockX = (blockIdx % blocksX) * BLOCK_SIZE;
+            int blockY = (blockIdx / blocksX) * BLOCK_SIZE;
+            
+            std::vector<uint8_t> block;
+            for (int by = 0; by < BLOCK_SIZE; ++by) {
+                for (int bx = 0; bx < BLOCK_SIZE; ++bx) {
+                    int px = blockX + bx;
+                    int py = blockY + by;
+                    block.push_back(pixels[py * w + px]);
+                }
+            }
+            
+            extractedBits[i] = extractBitFromBlock(block);
+        }
+        
         return true;
     }
 
-        bool createImageFromBits(const std::vector<uint8_t>& extractedBits, int width, int height, const std::string& filename)
+    bool createWatermarkImage(const std::vector<uint8_t>& extractedBits, int width, int height, const std::string& filename) override
     {
         
         if (extractedBits.size() != static_cast<size_t>(width * height)) {
-            std::cerr << "Ошибка: размер битов (" << extractedBits.size() 
-                    << ") не соответствует размеру изображения (" 
-                    << width * height << ")" << std::endl;
+            std::cerr << "Error: size bits" << std::endl;
             return false;
         }
         
@@ -426,22 +557,17 @@ public:
         header.bfType = 0x4D42;
         header.bfOffBits = sizeof(header) + 1024;
         header.bfSize = header.bfOffBits + dataSize;
-        
         header.biSize = 40;
         header.biWidth = width;
         header.biHeight = height;
         header.biPlanes = 1;
         header.biBitCount = 8;
-        header.biCompression = 0;
         header.biSizeImage = dataSize;
-        header.biXPelsPerMeter = 2835;
-        header.biYPelsPerMeter = 2835;
         header.biClrUsed = 256;
-        header.biClrImportant = 256;
         
         std::ofstream file(filename, std::ios::binary);
         if (!file) {
-            std::cerr << "Ошибка: не удалось создать файл " << filename << std::endl;
+            std::cerr << "Error: open file" << filename << std::endl;
             return false;
         }
         
@@ -495,12 +621,14 @@ void testOnDataset(const std::string& datasetPath, const std::string& datasetNam
     std::cout << "\n===== Testing on " << datasetName << " =====\n";
     std::cout << "Embedder: " << embedder.name() << "\n";
 
+    int n = 30;
     int count = 0;
     double totalPSNR = 0.0;
+    std::vector<double> PSNR_i;
 
     for (const auto& entry : fs::directory_iterator(datasetPath)) {
         if (entry.path().extension() != ".bmp") continue;
-        if (++count > 10) break;
+        if (++count > n) break;
 
         GrayBMP container;
         if (!container.load(entry.path().string())) {
@@ -525,7 +653,7 @@ void testOnDataset(const std::string& datasetPath, const std::string& datasetNam
             continue;
         }
         
-        if (!embedder.createImageFromBits(extracted, wm.getWidth(), wm.getHeight(), "stego/" + datasetName + "/" + "extracted_" + embedder.name() + "_" + entry.path().stem().string() + ".bmp")) {
+        if (!embedder.createWatermarkImage(extracted, wm.getWidth(), wm.getHeight(), "stego/" + datasetName + "/" + embedder.name() + "/extracted/" + entry.path().stem().string() + ".bmp")) {
             std::cerr << "Create failed for " << entry.path() << "\n";
             continue;
         }
@@ -535,16 +663,35 @@ void testOnDataset(const std::string& datasetPath, const std::string& datasetNam
 
         double mse = Metrics::MSE(container.getPixels(), stego.getPixels());
         double psnr = Metrics::PSNR(mse);
+        PSNR_i.push_back(psnr);
         totalPSNR += psnr;
         std::cout << "  PSNR = " << std::fixed << std::setprecision(2) << psnr << " dB\n";
 
-        std::string outName = "stego/" + datasetName + "/" + embedder.name() + "_" + entry.path().stem().string() + ".bmp";
+        std::string outName = "stego/" + datasetName + "/" + embedder.name() + "/" + entry.path().stem().string() + ".bmp";
         stego.save(outName);
     }
 
     if (count > 0) {
         std::cout << "\nAverage PSNR for " << datasetName << ": "
                   << std::fixed << std::setprecision(2) << (totalPSNR / count) << " dB\n";
+    }
+
+    if (embedder.name() != "LSB")
+    {
+        double _x = totalPSNR / count;
+        double sum = 0.0;
+        for (auto psnr : PSNR_i)
+        {
+            sum += pow((psnr - _x), 2);
+        }
+        sum = sum / (n - 1);
+        double S = sqrt(sum);
+        std::cout << "\nS = "  << S << " dB\n"; 
+
+
+        double t = 1.96;
+
+        std::cout << "\nConfidence interval = [" << _x - t * (S / sqrt(n)) << ", " << _x + t * (S / sqrt(n)) << "]\n"; 
     }
 }
 
@@ -553,13 +700,26 @@ int main() {
     fs::create_directories("stego/BOSS");
     fs::create_directories("stego/Medical");
     fs::create_directories("stego/Flowers");
+    fs::create_directories("stego/BOSS/BlockAdaptive");
+    fs::create_directories("stego/BOSS/BlockAdaptive/extracted");
+    fs::create_directories("stego/BOSS/BlockLSB");
+    fs::create_directories("stego/BOSS/BlockLSB/extracted");
+    fs::create_directories("stego/Medical/BlockAdaptive");
+    fs::create_directories("stego/Medical/BlockAdaptive/extracted");
+    fs::create_directories("stego/Medical/BlockLSB");
+    fs::create_directories("stego/Medical/BlockLSB/extracted");
+    fs::create_directories("stego/Flowers/BlockAdaptive");
+    fs::create_directories("stego/Flowers/BlockAdaptive/extracted");
+    fs::create_directories("stego/Flowers/BlockLSB");
+    fs::create_directories("stego/Flowers/BlockLSB/extracted");
+
 
     std::string bossPath   = "../lab1/set1";
     std::string medicalPath = "../lab1/set2";
     std::string otherPath  = "../lab1/set3";
 
     Watermark wm;
-    if (!wm.loadFromBMP("./logo.bmp")) {
+    if (!wm.loadFromBMP("./watermark3.bmp")) {
         std::cerr << "Please provide a logo.bmp (binary image) as watermark.\n";
         return 1;
     }
@@ -568,17 +728,37 @@ int main() {
 
     std::string secretKey = "my_secret_phrase_123";
 
-    LSBKeyEmbedder lsbEmbedder;
-    AdaptiveGradientEmbedder adaptiveEmbedder;
+    BlockLSBEmbedder blockLsbEmbedder;
+    BlockAdaptiveEmbedder blockAdaptiveEmbedder;
 
-    testOnDataset(bossPath, "BOSS", lsbEmbedder, wm, secretKey);
-    testOnDataset(bossPath, "BOSS", adaptiveEmbedder, wm, secretKey);
+    // testOnDataset(bossPath, "BOSS", blockLsbEmbedder, wm, secretKey);
+    testOnDataset(bossPath, "BOSS", blockAdaptiveEmbedder, wm, secretKey);
 
-    testOnDataset(medicalPath, "Medical", lsbEmbedder, wm, secretKey);
-    testOnDataset(medicalPath, "Medical", adaptiveEmbedder, wm, secretKey);
+    // testOnDataset(medicalPath, "Medical", blockLsbEmbedder, wm, secretKey);
+    testOnDataset(medicalPath, "Medical", blockAdaptiveEmbedder, wm, secretKey);
 
-    testOnDataset(otherPath, "Flowers", lsbEmbedder, wm, secretKey);
-    testOnDataset(otherPath, "Flowers", adaptiveEmbedder, wm, secretKey);
+    // testOnDataset(otherPath, "Flowers", blockLsbEmbedder, wm, secretKey);
+    testOnDataset(otherPath, "Flowers", blockAdaptiveEmbedder, wm, secretKey);
+
+    //  GrayBMP image;
+    // if (!image.load("stego/BOSS/BlockAdaptive/1.bmp"))
+    //             return -1;
+    // GrayBMP plane = image.extractBitPlane(1);
+    // plane.save("adapt2_plane_1.bmp");
+    // plane = image.extractBitPlane(2);
+    // plane.save("adapt2_plane_2.bmp");
+    // plane = image.extractBitPlane(3);
+    // plane.save("adapt2_plane_3.bmp");
+    // plane = image.extractBitPlane(4);
+    // plane.save("adapt2_plane_4.bmp");
+    // plane = image.extractBitPlane(5);
+    // plane.save("adapt2_plane_5.bmp");
+    // plane = image.extractBitPlane(6);
+    // plane.save("adapt2_plane_6.bmp");
+    // plane = image.extractBitPlane(7);
+    // plane.save("adapt2_plane_7.bmp");
+    // plane = image.extractBitPlane(8);
+    // plane.save("adapt2_plane_8.bmp");
 
     return 0;
 }
