@@ -335,8 +335,6 @@ def main():
     
     detected_colluders, scores = system.detect_colluders(recovered_fingerprint)
     
-    # print("\n" + "=" * 70)
-    # print("РЕЗУЛЬТАТЫ ОБНАРУЖЕНИЯ")
     print("=" * 70)
     
     print(f"\nРеальные участники коалиции: {colluder_ids}")

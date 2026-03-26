@@ -263,7 +263,6 @@ def research_part1():
     
     plt.tight_layout()
     plt.savefig('research_part1_dependencies.png', dpi=300, bbox_inches='tight')
-    plt.show()
     
     return fingerprint_lengths, thresholds, c_values
 
@@ -397,7 +396,6 @@ def research_part2():
     
     plt.tight_layout()
     plt.savefig('research_part2_detection_rate.png', dpi=300, bbox_inches='tight')
-    plt.show()
     
     return results
 
@@ -439,7 +437,6 @@ def research_part2_heatmap(results, c_values, c_real_values):
     
     plt.tight_layout()
     plt.savefig('research_part2_heatmap.png', dpi=300, bbox_inches='tight')
-    plt.show()
 
 def main():
     fingerprint_lengths, thresholds, c_values = research_part1()
@@ -448,29 +445,6 @@ def main():
     
     c_real_values = [1, 2, 3, 4, 5, 6]
     research_part2_heatmap(results, c_values, c_real_values)
-    
-    # print("\n" + "=" * 80)
-    # print("ВЫВОДЫ ПО РЕЗУЛЬТАТАМ ИССЛЕДОВАНИЯ")
-    print("=" * 80)
-    
-    print("\n1. ЗАВИСИМОСТЬ ДЛИНЫ ЦОП И ПОРОГА ОТ c:")
-    print(f"   - Длина ЦОП растет линейно с увеличением c: m = 2 * c * ln(n/ε)")
-    print(f"   - Для n=10, ε=0.1: m = {2 * 2 * np.log(10/0.1):.0f} при c=2, "
-          f"{2 * 3 * np.log(10/0.1):.0f} при c=3, "
-          f"{2 * 5 * np.log(10/0.1):.0f} при c=5")
-    print("   - Увеличение длины ЦОП повышает устойчивость, но снижает невидимость")
-    
-    print("\n2. ВЛИЯНИЕ НЕСООТВЕТСТВИЯ РАЗМЕРА КОАЛИЦИИ:")
-    print("   - При c_real ≤ c: вероятность обнаружения высокая (80-100%)")
-    print("   - При c_real > c: эффективность резко падает (< 50%)")
-    print("   - Оптимально выбирать c ≥ ожидаемого размера коалиции")
-    
-    print("\n3. РЕКОМЕНДАЦИИ ПО ВЫБОРУ ПАРАМЕТРОВ:")
-    print("   - Для защиты от небольших коалиций (2-3 человека): c=3")
-    print("   - Для защиты от средних коалиций (3-5 человек): c=5")
-    print("   - При неизвестном размере коалиции выбирать c с запасом")
-    
-    print("\n" + "=" * 80)
 
 if __name__ == "__main__":
     main()
