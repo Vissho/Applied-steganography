@@ -126,7 +126,7 @@ class AudioSteganography:
         freq_max = 4000
         freq_range = freq_max - freq_min
         
-        fft_size = 2048
+        fft_size = 4096
         
         for i in range(h):
             for j in range(w):
@@ -150,12 +150,26 @@ class AudioSteganography:
                 
                 if len(freqs) > 0 and Sxx.shape[1] > 0:
                     power = np.mean(Sxx, axis=1)
-                    peak_idx = np.argmax(power)
+                    
+                    smooth_power = np.convolve(power, np.ones(5)/5, mode='same')
+                    
+                    peak_idx = np.argmax(smooth_power)
                     freq_detected = freqs[peak_idx]
                     
-                    if freq_min <= freq_detected <= freq_max:
-                        pixel_val = int((freq_detected - freq_min) / freq_range * 255)
-                        img_array[i, j] = min(255, max(0, pixel_val))
+                    if freq_detected < freq_min:
+                        freq_detected = freq_min
+                    if freq_detected > freq_max:
+                        freq_detected = freq_max
+                    
+                    pixel_val = int((freq_detected - freq_min) / freq_range * 255)
+                    pixel_val = min(255, max(0, pixel_val))
+                    
+                    if pixel_val < 10:
+                        pixel_val = 0
+                    if pixel_val > 245:
+                        pixel_val = 255
+                    
+                    img_array[i, j] = pixel_val
         
         img = Image.fromarray(img_array, mode='L')
         img.save(output_image_path)
@@ -308,3 +322,21 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# Частота дискретизации: 44.1 кГц (44100 Гц)
+
+# Параметры изображения:
+# Разрешение: 128×128 пикселей
+# Длительность тона на пиксель: 20 мс
+# Диапазон частот: 500–4000 Гц
+# Окно: Ханна (плавное нарастание/затухание)
+
+# Параметры эхо-встраивания текста:
+# Длительность бита: 300 мс
+# Задержка эха для бита '0': 80 мс (3528 семплов)
+# Задержка эха для бита '1': 160 мс (7056 семплов)
+# Амплитуда эха: 0.5 (50% от исходного сигнала)
+# Несущий сигнал: белый шум с амплитудой 0.05
+# Пауза между изображением и текстом: 1 секунда (тишина)
+
+# Маркер конца сообщения: 16 нулевых бит (0000000000000000)
